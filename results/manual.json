@@ -1,0 +1,48 @@
+{
+  "path": "manual",
+  "label": "manual loop (reduce in-loop)",
+  "model": "Qwen/Qwen3-4B-FP8",
+  "runs": [
+    {
+      "budget": 32,
+      "tokens": 32,
+      "latency_s": 0.6410946769174188,
+      "tok_per_s": 49.914624395051725,
+      "peak_mib": 4261.5615234375,
+      "baseline_mib": 4245.8974609375,
+      "decode_mib": 15.6640625,
+      "note": "1 full-vocab logit row alive at peak"
+    },
+    {
+      "budget": 128,
+      "tokens": 128,
+      "latency_s": 2.5543429339304566,
+      "tok_per_s": 50.110734271314904,
+      "peak_mib": 4270.7275390625,
+      "baseline_mib": 4245.8974609375,
+      "decode_mib": 24.830078125,
+      "note": "1 full-vocab logit row alive at peak"
+    },
+    {
+      "budget": 512,
+      "tokens": 512,
+      "latency_s": 10.246449165977538,
+      "tok_per_s": 49.968529751755604,
+      "peak_mib": 4371.3505859375,
+      "baseline_mib": 4245.8974609375,
+      "decode_mib": 125.453125,
+      "note": "1 full-vocab logit row alive at peak"
+    }
+  ],
+  "meta": {
+    "prompt_tokens": 31,
+    "vocab": 151936,
+    "dtype": "torch.bfloat16",
+    "decoding": "greedy",
+    "other_gpu_mib_at_start": 4218.0,
+    "torch": "2.14.1+cu130",
+    "gpu": "NVIDIA GeForce RTX 5080",
+    "host": "kh-X870-Pro-RS-WiFi",
+    "saved_at": "2026-10-03 18:26:01"
+  }
+}

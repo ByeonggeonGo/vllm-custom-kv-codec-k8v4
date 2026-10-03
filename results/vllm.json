@@ -1,0 +1,48 @@
+{
+  "path": "vllm",
+  "label": "vLLM server (HTTP)",
+  "model": "local",
+  "runs": [
+    {
+      "budget": 32,
+      "tokens": 32,
+      "latency_s": 0.20657150307670236,
+      "tok_per_s": 154.91004094653866,
+      "peak_mib": 9860.0,
+      "baseline_mib": 9860.0,
+      "decode_mib": 0.0,
+      "note": "server preallocates --gpu-memory-utilization; per-request delta is not comparable"
+    },
+    {
+      "budget": 128,
+      "tokens": 128,
+      "latency_s": 0.8145627530757338,
+      "tok_per_s": 157.13951996538103,
+      "peak_mib": 9860.0,
+      "baseline_mib": 9860.0,
+      "decode_mib": 0.0,
+      "note": "server preallocates --gpu-memory-utilization; per-request delta is not comparable"
+    },
+    {
+      "budget": 512,
+      "tokens": 512,
+      "latency_s": 3.2479908601380885,
+      "tok_per_s": 157.6359115672611,
+      "peak_mib": 9860.0,
+      "baseline_mib": 9860.0,
+      "decode_mib": 0.0,
+      "note": "server preallocates --gpu-memory-utilization; per-request delta is not comparable"
+    }
+  ],
+  "meta": {
+    "served_models": [
+      "local"
+    ],
+    "server_pid": 287131,
+    "decoding": "greedy",
+    "fingerprint": "vllm-0.30.0-8d95730e",
+    "memory_caveat": "cross-process: nvidia-smi sampling, not a torch allocator peak",
+    "host": "kh-X870-Pro-RS-WiFi",
+    "saved_at": "2026-10-03 18:16:28"
+  }
+}

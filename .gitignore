@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# results/ IS committed: the measurements are the point of the repo.

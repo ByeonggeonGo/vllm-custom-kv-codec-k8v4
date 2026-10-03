@@ -1,0 +1,8 @@
+# The three run_*.py scripts need only these two (plus CUDA).
+torch>=2.4
+transformers>=4.45
+# FP8 checkpoints only; without it they fail at the first forward pass, not at load.
+kernels>=0.17.0,<0.18.0
+# compare.ipynb
+matplotlib>=3.9
+ipykernel>=6
