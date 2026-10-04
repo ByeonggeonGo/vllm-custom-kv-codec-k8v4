@@ -61,7 +61,13 @@ def decode(model, tok, input_ids: torch.Tensor, budget: int, eos_ids: frozenset[
 
     with torch.inference_mode():
         for _ in range(budget):
-            out = model(input_ids=cur, past_key_values=cache, use_cache=True)
+            # logits_to_keep=1 is what generate() passes (generation/utils.py sets it
+            # when forward() accepts it). Without it the prefill computes a logit row
+            # for all 31 prompt positions against generate()'s 1 - ~8.7 MiB this path
+            # would pay and the other would not. Fairness, not an optimization.
+            out = model(
+                input_ids=cur, past_key_values=cache, use_cache=True, logits_to_keep=1
+            )
             cache = out.past_key_values
             logits = out.logits[0, -1].float()  # only the last position predicts
 
