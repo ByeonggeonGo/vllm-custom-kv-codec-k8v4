@@ -1,10 +1,3 @@
-"""FFT KV compression 실험용 유틸.
-
-노트북에서 import해서 쓴다. 측정에 관한 규칙 하나만 지킨다: teacher와 student는
-항상 **같은 모델 weight**다. 차이는 캐시가 KV를 그대로 흘려보내느냐, spectral
-filter를 통과시키느냐 뿐이다. 그래서 모든 차이는 압축 탓이라고 말할 수 있다.
-"""
-
 from __future__ import annotations
 
 import math
@@ -213,38 +206,57 @@ def evaluate(
 
 # ------------------------------------------------------------------ 가설 점검
 class _SpectrumProbe(DynamicCache):
-    """압축은 하지 않고, 레이어별 K/V의 rFFT 크기만 모으는 캐시."""
+    """압축은 하지 않고, 레이어별 K/V의 rFFT 크기만 모으는 캐시.
 
-    def __init__(self, config=None):
+    axis="head": 토큰·head마다 D차원 벡터를 FFT. 샘플 하나 = (b, h, s), F = D//2+1.
+    axis="seq":  head·채널마다 길이 S 시계열을 FFT. 샘플 하나 = (b, h, d), F = S//2+1.
+    """
+
+    def __init__(self, config=None, axis: str = "head"):
         super().__init__(config=config)
+        if axis not in ("head", "seq"):
+            raise ValueError(f"unknown axis: {axis}")
+        self.axis = axis
         self.mag: dict[tuple[int, str], torch.Tensor] = {}
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         for which, states in (("k", key_states), ("v", value_states)):
-            mag = torch.fft.rfft(states.float(), dim=-1).abs()  # (B, H, S, F)
+            if self.axis == "head":
+                mag = torch.fft.rfft(states.float(), dim=-1).abs()  # (B, H, S, F)
+            else:
+                mag = torch.fft.rfft(states.float(), dim=-2).abs()  # (B, H, F, D)
+                mag = mag.transpose(-1, -2)                         # (B, H, D, F)
             self.mag[(layer_idx, which)] = mag.reshape(-1, mag.shape[-1]).cpu()
         return super().update(key_states, value_states, layer_idx, *args, **kwargs)
 
 
 @torch.no_grad()
-def spectrum_stats(model, ids: torch.Tensor) -> dict:
+def spectrum_stats(model, ids: torch.Tensor, axis: str = "head", drop_dc: bool = False) -> dict:
     """"K/V가 FFT basis에서 정말 sparse한가"를 재는 가장 직접적인 숫자.
+
+    axis: "head"면 head_dim 축, "seq"면 sequence 축으로 FFT한다 (`_SpectrumProbe`).
+    drop_dc: bin 0을 빼고 잰다. seq 축에서는 DC = 채널별 시간 평균이라, 채널 bias가 큰
+             K에서는 DC 하나가 에너지를 독차지해 sparse해 보이는 착시를 만든다.
 
     반환:
         mean_mag[(layer, which)]   주파수별 평균 |계수| (F,)
         energy_curve[(layer, which)] 크기 순 상위 m개를 남겼을 때 보존되는 에너지
                                      비율 (F,). 1에 빨리 붙을수록 sparse하다.
+        n_freq                     F. axis="seq"면 ids 길이에 따라 달라진다.
     """
-    probe = _SpectrumProbe(config=model.config)
+    probe = _SpectrumProbe(config=model.config, axis=axis)
     forward_logits(model, ids, cache=probe)
     mean_mag, energy = {}, {}
     for key, mag in probe.mag.items():
+        if drop_dc:
+            mag = mag[:, 1:]
         mean_mag[key] = mag.mean(0)
         power = mag.pow(2)
         ordered = power.sort(dim=-1, descending=True).values
         curve = ordered.cumsum(-1) / ordered.sum(-1, keepdim=True).clamp_min(1e-12)
         energy[key] = curve.mean(0)
-    return {"mean_mag": mean_mag, "energy_curve": energy}
+    n_freq = next(iter(mean_mag.values())).shape[-1]
+    return {"mean_mag": mean_mag, "energy_curve": energy, "n_freq": n_freq}
 
 
 @torch.no_grad()

@@ -1,22 +1,3 @@
-"""FFT 기반 adaptive KV compression에 필요한 레이어들.
-
-흐름은 계획서 그대로다::
-
-    K, V -> rFFT(head_dim 축) -> selector가 만든 mask -> irFFT -> 기존 attention
-
-끼워넣는 지점은 attention 내부가 아니라 **캐시의 update()** 다. transformers v5의
-`Qwen3Attention.forward`는 RoPE를 적용한 뒤 딱 한 줄로
-
-    key_states, value_states = past_key_values.update(key_states, value_states, layer_idx)
-
-를 호출하고, 그 반환값으로 attention을 계산한다. 즉 `DynamicCache.update`를 감싸면
-"캐시에 들어가는 KV"와 "attention이 보는 KV"를 동시에 바꿀 수 있다. 모델 코드는
-한 줄도 수정하지 않는다.
-
-주의: `update`는 새로 들어온 토큰만 받고, 과거 토큰은 이미 압축된 상태로 저장되어
-있으므로 이중 압축이 일어나지 않는다.
-"""
-
 from __future__ import annotations
 
 import torch

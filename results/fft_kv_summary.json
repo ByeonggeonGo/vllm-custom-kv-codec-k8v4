@@ -322,47 +322,47 @@
   "soft_init_usage": 0.9820138216018677
  },
  "stage1_soft": {
-  "kl": 0.41599718034267424,
-  "agree": 0.6390625,
-  "ppl": 46.58114500393479,
+  "kl": 0.19942133128643036,
+  "agree": 0.7498046875,
+  "ppl": 40.231067312641194,
   "ppl_teacher": 36.457373271347066,
-  "usage": 0.47543656826019287
+  "usage": 0.6176239073276519
  },
  "stage1_to_hard": [
   {
    "mode": "topk",
    "keep_ratio": 1.0,
-   "kl": 0.0010164534207433463,
-   "agree": 0.9771484375,
-   "ppl": 36.412809110519326
+   "kl": 0.0010489417240023614,
+   "agree": 0.979296875,
+   "ppl": 36.44969633444111
   },
   {
    "mode": "topk",
    "keep_ratio": 0.875,
-   "kl": 4.247488594055175,
-   "agree": 0.1392578125,
-   "ppl": 1970.0692335975205
+   "kl": 5.443149471282959,
+   "agree": 0.101171875,
+   "ppl": 6658.247960978989
   },
   {
    "mode": "topk",
    "keep_ratio": 0.75,
-   "kl": 6.765859699249267,
-   "agree": 0.0634765625,
-   "ppl": 22568.06932750503
+   "kl": 7.869584703445435,
+   "agree": 0.0517578125,
+   "ppl": 73281.56264504413
   },
   {
    "mode": "topk",
    "keep_ratio": 0.5,
-   "kl": 8.425082015991212,
-   "agree": 0.0177734375,
-   "ppl": 101716.60574529626
+   "kl": 9.223420429229737,
+   "agree": 0.019140625,
+   "ppl": 236986.29676221832
   },
   {
    "mode": "topk",
    "keep_ratio": 0.25,
-   "kl": 8.778484058380126,
-   "agree": 0.0146484375,
-   "ppl": 135270.1208596066
+   "kl": 8.618788051605225,
+   "agree": 0.0138671875,
+   "ppl": 126946.00341916592
   },
   {
    "mode": "energy",
@@ -439,33 +439,33 @@
   {
    "mode": "topk (learned, STE)",
    "keep_ratio": 0.9375,
-   "kl": 1.6943248391151429,
-   "agree": 0.368359375,
-   "ppl": 143.88395556999262,
+   "kl": 1.9638307094573975,
+   "agree": 0.3203125,
+   "ppl": 192.01904075986278,
    "ppl_teacher": 36.457373271347066
   },
   {
    "mode": "topk (learned, STE)",
    "keep_ratio": 0.875,
-   "kl": 2.5638700485229493,
-   "agree": 0.2412109375,
-   "ppl": 329.303434185587,
+   "kl": 2.356393027305603,
+   "agree": 0.269140625,
+   "ppl": 270.6042096492936,
    "ppl_teacher": 36.457373271347066
   },
   {
    "mode": "topk (learned, STE)",
    "keep_ratio": 0.75,
-   "kl": 2.8568451166152955,
-   "agree": 0.213671875,
-   "ppl": 426.33786549024194,
+   "kl": 2.8556149005889893,
+   "agree": 0.2150390625,
+   "ppl": 419.4025448542541,
    "ppl_teacher": 36.457373271347066
   },
   {
    "mode": "topk (learned, STE)",
    "keep_ratio": 0.5,
-   "kl": 3.587613272666931,
-   "agree": 0.1341796875,
-   "ppl": 834.7466911812342,
+   "kl": 3.6991970539093018,
+   "agree": 0.1171875,
+   "ppl": 930.2735986425826,
    "ppl_teacher": 36.457373271347066
   },
   {
@@ -605,9 +605,9 @@
  "layer_budget_trained": {
   "skip": 12,
   "keep": 0.5,
-  "kl": 0.43214680850505827,
-  "agree": 0.6349609375,
-  "ppl": 48.192671752540356,
+  "kl": 0.4312922805547714,
+  "agree": 0.6390625,
+  "ppl": 49.06527222232583,
   "ppl_teacher": 36.457373271347066
  },
  "memory_table": [
@@ -663,16 +663,16 @@
  ],
  "stage3_gen_untrained": {
   "text": "\u043b\u043e\u0442ymrythofzeotom.typstitute-tableathingatory\u0e48\u0e32\u0e22otenof-#elif-extr.-mapb-- f. odinousetically openL,abcdefghijklmnopumer-wheel seneut- Hartfordace board mutual\u75ffTaylor tym-\u0430\u0439",
-  "tok_per_s": 64.07916306090026,
+  "tok_per_s": 64.95826001363874,
   "footprint_bytes": 6021120
  },
  "stage3_gen_trained skip12": {
-  "text": " in the.. \n\n. \n\n. \n\n...,.... \n\n......,. in. ...... in and-witherens a.... the.....",
-  "tok_per_s": 65.72649370805601,
+  "text": ".. the.. the example is... the. example to... the costcplusplus.,..... over o\u4e4e of. way_w-plus.. time ofay_tetae? with..",
+  "tok_per_s": 64.33156454249114,
   "footprint_bytes": 6021120
  },
  "stage3_gen_ref": {
   "text": "The sky appears blue because of the way light interacts with the Earth's atmosphere, where shorter wavelengths of light (blue) are scattered more efficiently than longer wavelengths (red and orange). This scattering causes the blue light to be scattered in all directions",
-  "tok_per_s": 118.4802947485287
+  "tok_per_s": 129.03831631575838
  }
 }
