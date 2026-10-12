@@ -12,3 +12,6 @@ results/corpus_*.txt
 # 개인 작업용 (리포 사용자에게 불필요)
 make_figures.py
 compare.ipynb
+PLAN_vllm_codec.md
+*.egg-info/
+build/
