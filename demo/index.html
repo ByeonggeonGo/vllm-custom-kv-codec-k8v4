@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV cache codec bench</title>
+<style>
+:root {
+  --bg: #f6f5f2; --surface: #fcfcfb; --line: #e2e0da; --text: #0b0b0b; --text2: #52514e; --muted: #8a8984;
+  --accent: #2a78d6;
+  --s-bf16: #2a78d6; --s-vllm-int8: #eb6834; --s-vllm-int4: #1baf7a; --s-ours-k8v4: #eda100; --s-ours-k4v4: #e87ba4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121211; --surface: #1a1a19; --line: #33322f; --text: #f0efec; --text2: #c3c2b7; --muted: #8f8e86;
+    --accent: #3987e5;
+    --s-bf16: #3987e5; --s-vllm-int8: #d95926; --s-vllm-int4: #199e70; --s-ours-k8v4: #c98500; --s-ours-k4v4: #d55181;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1320px; margin: 0 auto; padding: 20px 16px 48px; }
+h1 { font-size: 20px; margin: 0 0 2px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--text2); margin: 28px 0 10px; }
+.sub { color: var(--text2); margin: 0; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.card { cursor: pointer; position: relative; }
+.card input { position: absolute; top: 12px; right: 12px; width: 16px; height: 16px; accent-color: var(--accent); }
+.card .name { font-weight: 600; display: flex; align-items: center; gap: 7px; padding-right: 26px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.card .note { color: var(--text2); font-size: 12px; min-height: 34px; margin: 2px 0 8px; }
+.card .big { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.card .unit { color: var(--text2); font-size: 12px; }
+.bar { height: 6px; background: var(--line); border-radius: 3px; margin: 6px 0 8px; overflow: hidden; }
+.bar > i { display: block; height: 100%; border-radius: 3px; }
+.kv { display: flex; justify-content: space-between; font-size: 12px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.kv b { color: var(--text); font-weight: 600; }
+.card.down { opacity: .45; }
+.tag { font-size: 10px; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; color: var(--text2); font-weight: 500; }
+.controls { display: grid; grid-template-columns: 1fr; gap: 10px; }
+textarea { width: 100%; min-height: 64px; resize: vertical; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit; }
+.row { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+label.f { color: var(--text2); font-size: 12px; display: flex; gap: 6px; align-items: center; }
+select, input[type=number] { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: inherit; }
+button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 7px 16px; font: inherit; font-weight: 600; cursor: pointer; }
+button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+button:disabled { opacity: .5; cursor: default; }
+.outs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.out .head { display: flex; align-items: center; gap: 7px; font-weight: 600; margin-bottom: 6px; }
+.out pre { white-space: pre-wrap; word-break: break-word; margin: 0; font: 13px/1.5 system-ui, sans-serif; min-height: 72px; max-height: 260px; overflow: auto; }
+.out .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); font-size: 12px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.out .stats b { color: var(--text); }
+.err { color: #c0392b; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 10px; }
+.chart h3 { font-size: 13px; margin: 0; }
+.chart p { margin: 0 0 4px; color: var(--text2); font-size: 12px; }
+.chart svg { width: 100%; height: 230px; display: block; overflow: visible; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text2); margin-top: 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.tip { position: fixed; pointer-events: none; background: var(--text); color: var(--bg); padding: 5px 8px; border-radius: 5px; font-size: 12px; white-space: nowrap; display: none; z-index: 10; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--text2); font-weight: 500; }
+.foot { color: var(--muted); font-size: 12px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>KV cache codec bench</h1>
+  <p class="sub" id="sub">Same model, same KV cache budget per server. Only the cache format differs.</p>
+
+  <h2>Servers</h2>
+  <div class="cards" id="cards"></div>
+
+  <h2>Prompt</h2>
+  <div class="panel controls">
+    <textarea id="prompt">Who are the main people mentioned in the passage above? Answer in one or two sentences.</textarea>
+    <div class="row">
+      <label class="f">Context passage
+        <select id="ctx">
+          <option value="0">none</option><option value="128">~128 tokens</option><option value="256">~256</option>
+          <option value="512" selected>~512</option><option value="1024">~1024</option><option value="1600">~1600</option>
+        </select>
+      </label>
+      <label class="f">Max new tokens <input type="number" id="maxtok" value="64" min="8" max="256" step="8" style="width:72px"></label>
+      <label class="f" title="One GPU is shared: running servers one at a time keeps timings clean"><input type="checkbox" id="seq" checked> one server at a time (clean timing)</label>
+      <button id="run">Run</button>
+      <button id="sweep" class="ghost" title="Runs the prompt at every context length to draw the trend">Sweep context length</button>
+      <span id="status" class="sub"></span>
+    </div>
+  </div>
+
+  <h2>Answers</h2>
+  <div class="outs" id="outs"></div>
+
+  <h2>Trends</h2>
+  <div class="charts">
+    <div class="panel chart"><h3>KV cache in use</h3><p>MB of the fixed pool, sampled every second</p><svg id="c-kv"></svg></div>
+    <div class="panel chart"><h3>GPU memory per server</h3><p>MiB, process total from nvidia-smi (weights + pool + runtime)</p><svg id="c-gpu"></svg></div>
+    <div class="panel chart"><h3>KV memory per request</h3><p>MB for prompt + generated tokens, by prompt length</p><svg id="c-kvreq"></svg></div>
+    <div class="panel chart"><h3>Decode speed</h3><p>tokens/s after the first token, by prompt length</p><svg id="c-tps"></svg></div>
+    <div class="panel chart"><h3>Time to first token</h3><p>ms, by prompt length</p><svg id="c-ttft"></svg></div>
+    <div class="panel chart"><h3>Latest runs</h3><p>most recent request per server</p><div id="tbl"></div></div>
+  </div>
+  <div class="legend" id="legend"></div>
+  <p class="foot">All servers run eagerly with prefix caching off. "ours" = the kvcodec plugin in this repo: it shrinks the cache cell and
+  decodes it in PyTorch on every step, so it is slower than vLLM's Triton kernels. GPU memory stays flat because vLLM allocates the whole pool at startup;
+  the pool holds more tokens under a smaller cell. The plugin servers sit a few hundred MiB higher after their first request: that is PyTorch
+  keeping the scratch tensors used to unpack the cache, not the cache itself.</p>
+</main>
+<div class="tip" id="tip"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const color = (name) => css('--s-' + name);
+const fmt = (v, d = 0) => v == null || Number.isNaN(v) ? '–' : v.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
+const CTX = [0, 128, 256, 512, 1024, 1600];
+let servers = [], history = [], runs = [], since = 0, poolMb = 256, busy = false;
+const selected = new Set(JSON.parse(localStorage.getItem('sel') || 'null') || ['bf16', 'vllm-int4', 'ours-k8v4', 'ours-k4v4']);
+
+// ---------------------------------------------------------------- 서버 카드
+function renderCards() {
+  const maxCap = Math.max(1, ...servers.map(s => s.capacity_tokens || 0));
+  const last = history[history.length - 1];
+  $('#cards').innerHTML = servers.map(s => {
+    const live = last && last.servers[s.name] || {};
+    const cap = s.capacity_tokens || 0;
+    return `<label class="panel card ${s.up ? '' : 'down'}">
+      <input type="checkbox" data-name="${s.name}" ${selected.has(s.name) ? 'checked' : ''} ${s.up ? '' : 'disabled'}>
+      <div class="name"><i class="dot" style="background:${color(s.name)}"></i>${s.label}${s.ours ? '<span class="tag">plugin</span>' : ''}</div>
+      <div class="note">${s.up ? s.note : 'server not running'}</div>
+      <div><span class="big">${fmt(cap)}</span> <span class="unit">tokens fit in ${fmt(poolMb)} MB</span></div>
+      <div class="bar"><i style="width:${100 * cap / maxCap}%;background:${color(s.name)}"></i></div>
+      <div class="kv"><span>per token</span><b>${fmt((s.bytes_per_token || 0) / 1024, 1)} KB</b></div>
+      <div class="kv"><span>KV in use</span><b>${fmt((live.kv_usage || 0) * poolMb, 1)} MB</b></div>
+      <div class="kv"><span>GPU memory</span><b>${fmt(live.gpu_mib)} MiB</b></div>
+    </label>`;
+  }).join('');
+  document.querySelectorAll('#cards input').forEach(el => el.onchange = () => {
+    el.checked ? selected.add(el.dataset.name) : selected.delete(el.dataset.name);
+    localStorage.setItem('sel', JSON.stringify([...selected]));
+    drawAll();
+  });
+  $('#legend').innerHTML = servers.map(s => `<span><i class="dot" style="background:${color(s.name)}"></i>${s.label}</span>`).join('');
+}
+
+// ---------------------------------------------------------------- 선 그래프
+function lineChart(svg, series, opt) {
+  const W = svg.clientWidth || 400, H = 230, m = { l: 46, r: 14, t: 10, b: 26 };
+  const pts = series.flatMap(s => s.points);
+  if (!pts.length) { svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle" fill="${css('--muted')}" font-size="12">${opt.empty || 'no data yet'}</text>`; return; }
+  let x0 = Math.min(...pts.map(p => p.x)), x1 = Math.max(...pts.map(p => p.x));
+  let y1 = Math.max(...pts.map(p => p.y)) * 1.12 || 1; const y0 = 0;
+  if (x1 === x0) { x0 -= 1; x1 += 1; }
+  const X = v => m.l + (v - x0) / (x1 - x0) * (W - m.l - m.r), Y = v => H - m.b - (v - y0) / (y1 - y0) * (H - m.t - m.b);
+  const nice = (lo, hi, n) => { const step = Math.pow(10, Math.floor(Math.log10((hi - lo) / n))); const f = (hi - lo) / n / step;
+    const s = step * (f > 5 ? 10 : f > 2 ? 5 : f > 1 ? 2 : 1); const out = []; for (let v = Math.ceil(lo / s) * s; v <= hi + 1e-9; v += s) out.push(v); return out; };
+  let g = '';
+  for (const v of nice(y0, y1, 4)) g += `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}" stroke="${css('--line')}"/><text x="${m.l - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="11" fill="${css('--text2')}">${fmt(v, v < 10 && v % 1 ? 1 : 0)}</text>`;
+  const xt = opt.time ? [x0, (x0 + x1) / 2, x1] : nice(x0, x1, 5);
+  for (const v of xt) g += `<text x="${X(v)}" y="${H - 8}" text-anchor="middle" font-size="11" fill="${css('--text2')}">${opt.time ? '−' + Math.round(x1 - v) + 's' : fmt(v)}</text>`;
+  if (opt.xlabel) g += `<text x="${W - m.r}" y="${H - 8}" text-anchor="end" font-size="11" fill="${css('--muted')}" dy="-14">${opt.xlabel}</text>`;
+  for (const s of series) {
+    if (!s.points.length) continue;
+    const d = s.points.map((p, i) => (i ? 'L' : 'M') + X(p.x).toFixed(1) + ' ' + Y(p.y).toFixed(1)).join(' ');
+    g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round"/>`;
+    if (!opt.time) for (const p of s.points) g += `<circle cx="${X(p.x)}" cy="${Y(p.y)}" r="4" fill="${s.color}" stroke="${css('--surface')}" stroke-width="2"/>`;
+  }
+  svg.innerHTML = g;
+  svg.onmousemove = (e) => {
+    const r = svg.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+    let best = null;
+    for (const s of series) for (const p of s.points) { const d = Math.hypot(X(p.x) - mx, Y(p.y) - my); if (!best || d < best.d) best = { d, s, p }; }
+    const tip = $('#tip');
+    if (!best || best.d > 40) { tip.style.display = 'none'; return; }
+    tip.textContent = `${best.s.label}: ${fmt(best.p.y, 1)} ${opt.unit || ''}` + (opt.time ? '' : ` @ ${fmt(best.p.x)} prompt tokens`);
+    tip.style.display = 'block'; tip.style.left = (e.clientX + 12) + 'px'; tip.style.top = (e.clientY - 28) + 'px';
+  };
+  svg.onmouseleave = () => $('#tip').style.display = 'none';
+}
+
+function drawAll() {
+  const shown = servers.filter(s => selected.has(s.name));
+  const now = history.length ? history[history.length - 1].t : 0;
+  const recent = history.filter(h => h.t > now - 300);
+  const timeSeries = (f) => shown.map(s => ({ label: s.label, color: color(s.name),
+    points: recent.filter(h => h.servers[s.name]).map(h => ({ x: h.t - now + 300, y: f(h.servers[s.name]) })) }));
+  lineChart($('#c-kv'), timeSeries(v => v.kv_usage * poolMb), { time: true, unit: 'MB' });
+  lineChart($('#c-gpu'), timeSeries(v => v.gpu_mib), { time: true, unit: 'MiB' });
+  const runSeries = (key) => shown.map(s => {
+    const byLen = new Map();   // 같은 프롬프트 길이는 최신 값만
+    for (const r of runs) if (r.server === s.name && r[key] != null) byLen.set(r.prompt_tokens, r[key]);
+    return { label: s.label, color: color(s.name), points: [...byLen].sort((a, b) => a[0] - b[0]).map(([x, y]) => ({ x, y })) };
+  });
+  const empty = 'run a prompt or a sweep';
+  lineChart($('#c-kvreq'), runSeries('kv_mb'), { unit: 'MB', xlabel: 'prompt tokens', empty });
+  lineChart($('#c-tps'), runSeries('tok_per_s'), { unit: 'tok/s', xlabel: 'prompt tokens', empty });
+  lineChart($('#c-ttft'), runSeries('ttft_ms'), { unit: 'ms', xlabel: 'prompt tokens', empty });
+  const latest = servers.map(s => [s, [...runs].reverse().find(r => r.server === s.name)]).filter(([, r]) => r);
+  $('#tbl').innerHTML = latest.length ? `<table><tr><th>server</th><th>prompt</th><th>new</th><th>TTFT ms</th><th>tok/s</th><th>KV MB</th></tr>` +
+    latest.map(([s, r]) => `<tr><td><i class="dot" style="display:inline-block;background:${color(s.name)}"></i> ${s.label}</td><td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.completion_tokens)}</td><td>${fmt(r.ttft_ms)}</td><td>${fmt(r.tok_per_s, 1)}</td><td>${fmt(r.kv_mb, 2)}</td></tr>`).join('') + '</table>'
+    : `<p class="sub" style="padding:24px 0;text-align:center">${empty}</p>`;
+}
+
+// ---------------------------------------------------------------- 상태 폴링
+async function poll() {
+  try {
+    const s = await (await fetch('/api/state?since=' + since)).json();
+    servers = s.servers; poolMb = s.pool_mb; since = s.now;
+    history.push(...s.history); history = history.slice(-900);
+    const seen = new Set(runs.map(r => r.server + r.t)); runs.push(...s.runs.filter(r => !seen.has(r.server + r.t)));
+    $('#sub').textContent = `Qwen3-0.6B on vLLM 0.30 · ${fmt(poolMb)} MB KV cache per server · only the cache format differs`;
+    renderCards(); if (!busy) drawAll();
+  } catch (e) { $('#status').textContent = 'backend unreachable'; }
+  setTimeout(poll, 1000);
+}
+
+// ---------------------------------------------------------------- 생성
+function outBoxes(names) {
+  $('#outs').innerHTML = names.map(n => { const s = servers.find(x => x.name === n);
+    return `<div class="panel out" id="o-${n}"><div class="head"><i class="dot" style="background:${color(n)}"></i>${s.label}</div><pre></pre><div class="stats"></div></div>`; }).join('');
+}
+async function generate(ctxTokens) {
+  const names = servers.filter(s => s.up && selected.has(s.name)).map(s => s.name);
+  if (!names.length) { $('#status').textContent = 'select at least one running server'; return; }
+  let prompt = $('#prompt').value;
+  if (ctxTokens > 0) { const p = await (await fetch('/api/passage?tokens=' + ctxTokens)).json(); prompt = 'Read the passage.\n\n' + p.text + '\n\n' + prompt; }
+  outBoxes(names);
+  const resp = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ servers: names, prompt, max_tokens: +$('#maxtok').value, sequential: $('#seq').checked }) });
+  const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i; while ((i = buf.indexOf('\n\n')) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 2);
+      if (!line.startsWith('data:')) continue;
+      const ev = JSON.parse(line.slice(5)); const box = ev.server && $('#o-' + ev.server);
+      if (ev.type === 'token') box.querySelector('pre').textContent += ev.text;
+      else if (ev.type === 'error') box.querySelector('pre').innerHTML = `<span class="err">${ev.message}</span>`;
+      else if (ev.type === 'result') { runs.push(ev);
+        box.querySelector('.stats').innerHTML = `<span>TTFT <b>${fmt(ev.ttft_ms)} ms</b></span><span>speed <b>${fmt(ev.tok_per_s, 1)} tok/s</b></span>
+          <span>tokens <b>${fmt(ev.prompt_tokens)} + ${fmt(ev.completion_tokens)}</b></span><span>KV <b>${fmt(ev.kv_mb, 2)} MB</b></span>`; }
+    }
+  }
+  drawAll();
+}
+async function guard(fn) { if (busy) return; busy = true; $('#run').disabled = $('#sweep').disabled = true;
+  try { await fn(); } catch (e) { $('#status').textContent = String(e); } busy = false; $('#run').disabled = $('#sweep').disabled = false; drawAll(); }
+$('#run').onclick = () => guard(async () => { $('#status').textContent = 'running…'; await generate(+$('#ctx').value); $('#status').textContent = ''; });
+$('#sweep').onclick = () => guard(async () => { for (const c of CTX) { $('#status').textContent = `sweep: ~${c} context tokens`; $('#ctx').value = c; await generate(c); } $('#status').textContent = 'sweep done'; });
+window.onresize = () => drawAll();
+poll();
+// 주소에 #autorun을 붙이면 서버 상태를 받은 뒤 한 번 실행 (스크린샷용)
+if (location.hash === '#autorun') { const t = setInterval(() => { if (servers.length) { clearInterval(t); $('#run').click(); } }, 300); }
+</script>
+</body>
+</html>

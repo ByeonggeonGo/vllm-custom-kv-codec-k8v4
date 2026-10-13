@@ -1,5 +1,130 @@
 # fft-based-kv-memory-compression
 
+Custom KV-cache codecs for vLLM, shipped as a plugin, with a web bench that runs them next to
+vLLM's built-in cache formats and plots memory and timing live.
+
+The repo started as an attempt to compress the KV cache with FFT. That failed (results folded
+below) and pointed at the real problem — the distribution of the key vectors — which the codecs
+here address directly.
+
+![KV cache codec bench](docs/demo.png)
+
+## Result
+
+Qwen3-0.6B on vLLM 0.30.0, one RTX 5080. Every server gets the same 256 MB KV cache; only the
+cache format differs.
+
+| Server | Cache cell | Tokens that fit in 256 MB | KV used, 1,695-token prompt + answer | PPL | Decode speed |
+|---|---:|---:|---:|---:|---:|
+| bf16 (vLLM default) | 512 B (1.000x) | 2,336 | 191 MB | 29.24 | 190 tok/s |
+| vLLM `int8_per_token_head` | 264 B (0.516x) | 4,528 | 98 MB | 29.92 | 197 tok/s |
+| **ours `k8v4`** | **198 B (0.387x)** | **6,048** | **74 MB** | **29.56** | 58 tok/s |
+| vLLM `int4_per_token_head` | 136 B (0.266x) | 8,800 | 50 MB | 89.14 | 117 tok/s |
+| **ours `k4v4`** | **136 B (0.266x)** | **8,800** | **51 MB** | **32.69** | 54 tok/s |
+
+- **Memory is really smaller.** The plugin declares a smaller cache cell, vLLM allocates the pool
+  with it, and vLLM's own `kv_cache_usage_perc` metric reports the difference: the 1,695-token
+  prompt occupies 74.5% of the bf16 pool, 28.9% with `k8v4`, 19.9% with `k4v4`.
+- **Quality is better than the built-ins at the same size.** `k8v4` is 25% smaller than vLLM int8
+  and closer to bf16. `k4v4` is the size of vLLM int4 with perplexity 32.7 instead of 89.1.
+- **Speed is worse.** The plugin unpacks the cache in PyTorch on every step; vLLM's formats are
+  read by Triton kernels. A kernel for this format is the next step.
+
+PPL is measured inside vLLM on every server the same way: token log-probabilities of six
+~1,500-token passages (9,119 tokens) from `/v1/completions` with `echo`. Speed is tokens per
+second after the first token, one server running at a time, all servers eager with prefix caching off.
+
+## How the codecs work
+
+A cache cell holds the key and the value of one (token, head): 2 × 128 bf16 values = 512 bytes.
+
+```
+k8v4   [ K: 128 × int8 | scale ] [ V: 64 bytes of packed int4 | lo | step ]   = 130 + 68 = 198 B
+k4v4   [ K:  64 bytes of packed int4 | lo | step ] [ V: same ]              =  68 + 68 = 136 B
+```
+
+Three things make 4 bits usable ([`kvcodec/codec.py`](kvcodec/codec.py)):
+
+1. **Rotation.** A key vector has a few channels 100–260× larger than its median. A scale fitted to
+   the maximum rounds 70–95% of the other channels to zero. Multiplying by a random-sign Hadamard
+   matrix spreads the magnitude over all 128 channels; the read path multiplies by the same matrix
+   to undo it.
+2. **Channel-mean removal** (`k4v4`). 56–90% of the energy of the keys is a per-channel constant
+   that does not depend on the token. Left in, it uses up the 16 levels. A table of per-(layer,
+   head, channel) means, computed once by [`kvcodec/calibrate.py`](kvcodec/calibrate.py), is
+   subtracted before quantizing and added back on read.
+3. **Spend bits where they matter** (`k8v4`). Values tolerate 4 bits (KL 0.017 against bf16); keys
+   do not (KL 1.42). Keys get 8 bits, values 4.
+
+| Step, both sides 4-bit | PPL (bf16 33.7) |
+|---|---:|
+| per-(token, head) scale only | 37,146 |
+| + rotation | 127 |
+| + asymmetric 16 levels | 82 |
+| + channel-mean removal (`k4v4`) | 39 |
+| keys 8-bit, values 4-bit, rotation (`k8v4`) | 34 |
+
+## How it plugs into vLLM
+
+vLLM is not modified or vendored. The package registers itself through the `vllm.general_plugins`
+entry point; vLLM imports it at startup and uses it when started with `--attention-backend CUSTOM`.
+
+```mermaid
+flowchart LR
+    P["pip install .<br/>(entry point: vllm.general_plugins)"] --> R["vLLM startup<br/>load_general_plugins()"]
+    R --> B["register_backend(CUSTOM,<br/>kvcodec.backend.CodecAttentionBackend)"]
+    B --> S["customize_spec()<br/>cell = 198 or 136 bytes"]
+    S --> A["vLLM allocates the pool<br/>with that cell size"]
+    A --> W["do_kv_cache_update()<br/>pack new tokens into pages"]
+    W --> F["forward()<br/>unpack pages, attention"]
+```
+
+[`kvcodec/backend.py`](kvcodec/backend.py) subclasses vLLM's Triton backend and overrides three things:
+`customize_spec` (cell size), `do_kv_cache_update` (write) and `forward` (read).
+
+## Running it
+
+```bash
+# five vLLM servers in docker, same model, same KV cache budget (needs ~11 GB of GPU memory)
+demo/servers.sh up            # or: demo/servers.sh up bf16 ours-k8v4
+python demo/app.py            # http://localhost:8200  (standard library only)
+demo/servers.sh down
+```
+
+The page sends one prompt to the selected servers, streams the answers side by side, and plots
+KV cache in use and GPU memory over time, and KV memory, decode speed and time to first token
+against prompt length. "Sweep context length" runs the prompt at six context sizes to draw the trend.
+
+To use a codec in your own vLLM 0.30 environment:
+
+```bash
+pip install --no-deps .
+KVCODEC=k8v4 vllm serve Qwen/Qwen3-0.6B --attention-backend CUSTOM --enforce-eager
+KVCODEC=k4v4 KVCODEC_MEAN=results/kv_mean_qwen3-0.6b.pt vllm serve Qwen/Qwen3-0.6B --attention-backend CUSTOM --enforce-eager
+```
+
+| Path | Contents |
+|---|---|
+| `kvcodec/codec.py` | pack / unpack, rotation, cell sizes (pure PyTorch) |
+| `kvcodec/backend.py` | vLLM attention backend for `k8v4` / `k4v4` |
+| `kvcodec/calibrate.py` | channel-mean table for `k4v4` |
+| `kvcodec/fft_backend.py` | the FFT codec as a backend (quality only, no memory saving) |
+| `demo/servers.sh`, `demo/app.py`, `demo/index.html` | servers and the web bench |
+
+## Limits
+
+- Tested on vLLM 0.30.0 only. `customize_spec` is marked a temporary API in vLLM's source.
+- Eager mode, prefix caching off. CUDA graphs and prefix caching are untested with the plugin.
+- The read path is PyTorch and unpacks the whole context every step: about 3× slower than bf16.
+  The plugin process also holds a few hundred MiB of scratch tensors.
+- `k4v4` needs a calibration table per model; the keys are post-RoPE, so the table should be built
+  with windows at least as long as the contexts served.
+- One 0.6B model, one book for perplexity. Both 4-bit formats (vLLM's and this one) break on very
+  short prompts.
+
+<details>
+<summary><b>Earlier experiment: FFT compression of the KV cache (negative result)</b></summary>
+
 Compressing a transformer's KV cache by storing a few FFT coefficients per channel instead of
 the raw values, measured on Qwen3-0.6B against plain KV quantization and context truncation.
 
@@ -43,7 +168,7 @@ Setup: Qwen3-0.6B (bf16, weights frozen), 640-token windows from a Gutenberg nov
 "Stored bytes" is counted from the tensors the codec actually keeps — coefficients,
 quantization scales and the selection bitmask — divided by the bf16 cache.
 
-## How it works
+### How it works
 
 ```mermaid
 flowchart LR
@@ -71,7 +196,7 @@ flowchart LR
 4. **Byte accounting by construction.** The codec builds the storage format and reconstructs from
    it alone, so the quality numbers and the byte numbers come from the same tensors.
 
-### Evaluation without future leakage
+#### Evaluation without future leakage
 
 A sequence-axis filter mixes information from later tokens of a block into earlier ones. Applied
 inside a single forward pass, a query would see the future. Compression is therefore applied the
@@ -88,7 +213,7 @@ flowchart LR
 The head-axis method is re-measured with the same protocol, so every row of the table above is
 comparable.
 
-## What moved the numbers
+### What moved the numbers
 
 ![Each step at 50% of coefficients](docs/fig_steps.png)
 
@@ -106,7 +231,7 @@ Each step is a real improvement over the one before, but the end point (KL 0.40)
 closer to "no past at all" (KL 0.66) than to the full context. Untrained energy top-k (KL 1.41)
 is *worse* than having no past: a damaged cache misleads attention more than a missing one.
 
-### Why the sequence axis
+#### Why the sequence axis
 
 ![Spectrum sparsity](docs/fig_spectrum.png)
 
@@ -115,7 +240,7 @@ makes even white noise score 0.84, so that, not 0.5, is the line to beat. Along 
 K cache sits below noise (0.79) and V on it (0.84): there is nothing to compress. Along the
 sequence the K cache reaches 0.89 even with the DC term removed.
 
-## Findings
+### Findings
 
 - **`head_dim`-axis FFT has no structure to exploit.** Dropping 12.5% of the coefficients already
   gives KL 4.06; dropping half gives perplexity 261,328.
@@ -148,7 +273,7 @@ sequence the K cache reaches 0.89 even with the DC term removed.
   with none, and the last 64 tokens already recover most of it. A task that needs the far past
   (retrieval, long-document QA) would separate the methods more sharply.
 
-## Limitations
+### Limitations
 
 - One 0.6B model, one book; 4,096 evaluated tokens. Next-token perplexity on a novel rewards
   recent context, so it understates what a faithful cache is worth.
@@ -159,7 +284,7 @@ sequence the K cache reaches 0.89 even with the DC term removed.
   `active_layers`; a sequence-axis cache for `generate()` is not written yet.
 - Training is not bit-reproducible on GPU; KL moves by about ±0.01 between runs.
 
-## Next
+### Next
 
 - **Evaluate on a task that needs the far past** (passkey retrieval, long-document QA). On such a
   task truncation fails outright, which is the only regime where a lossy codec can earn its bytes.
@@ -167,7 +292,7 @@ sequence the K cache reaches 0.89 even with the DC term removed.
   sequence-axis FFT, instead of replacing the values with coefficients.
 - **Per-frequency bit allocation** (transform coding with a DCT) instead of keep-or-drop.
 
-## Reproducing
+### Reproducing
 
 ```
 pip install -r requirements.txt
@@ -184,7 +309,10 @@ Section 9 runs in a few minutes on one GPU (RTX 5080 here). Sections 2–8 hold 
 | `fft_kv_compression.ipynb` | all experiments and the conclusion (Korean) |
 | `results/fft_kv_summary.json` | every measurement behind the tables |
 
-## Background: where the KV cache shows up in `generate()`
+</details>
+
+<details>
+<summary><b>Background: where the KV cache shows up in `generate()`</b></summary>
 
 This repo started as a memory and speed study of `model.generate()`, which is what pointed at
 the KV cache in the first place.
@@ -200,7 +328,7 @@ This measures what the two cost, and puts vLLM beside them for scale.
 Measured on an RTX 5080 (16 GB) with Qwen3-4B-FP8, greedy decoding, 31-token prompt.
 Another process held 4218 MiB of the card throughout.
 
-### Speed — tokens/sec
+#### Speed — tokens/sec
 
 | max_tokens | vLLM | `generate()` | manual loop |
 | ---------: | ---: | -----------: | ----------: |
@@ -211,7 +339,7 @@ Another process held 4218 MiB of the card throughout.
 vLLM is ~3.2x faster. `generate()` and the hand-written loop are indistinguishable: the
 cost is in the forward pass, not in the Python loop around it.
 
-### Decode memory — MiB above the weights
+#### Decode memory — MiB above the weights
 
 | max_tokens | vLLM | `generate()` | manual loop |
 | ---------: | ---: | -----------: | ----------: |
@@ -230,7 +358,7 @@ The gap divided by step count converges on the size of one float32 logit row
 
 At 512 steps that retained-logits term is 69% of what decoding cost `generate()`.
 
-### Two things the numbers correct
+#### Two things the numbers correct
 
 **The manual loop is not constant-memory.** It grows 15.7 -> 24.8 -> 125.5 MiB, because
 the KV cache grows with sequence length no matter how the loop is written. Both paths pay
@@ -252,7 +380,7 @@ vLLM's memory figure is also an `nvidia-smi` sample of another process, not a to
 allocator peak, so it is not on the same axis. The comparison vLLM genuinely contributes
 here is speed.
 
-### Running it
+#### Running it
 
 Each script is standalone — no shared module, no package to install from this repo.
 
@@ -272,7 +400,7 @@ The scripts print how much GPU memory other processes hold and warn above 500 Mi
 shared card skews the peaks and can OOM a long run outright — the figure is recorded in
 each result file's `meta` so a surprising measurement can be explained later.
 
-### Requirements
+#### Requirements
 
 ```
 pip install -r requirements.txt
@@ -282,3 +410,5 @@ CUDA is required. The FP8 checkpoint needs Triton kernels, which need Python hea
 (`sudo apt install python3.12-dev`) and the `kernels` package; a bf16 model such as
 `Qwen/Qwen3-0.6B` avoids the FP8 path but still uses Triton on recent torch builds.
 Change `MODEL` at the top of each script to switch.
+
+</details>

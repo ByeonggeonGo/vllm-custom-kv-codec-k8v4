@@ -3,14 +3,14 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fftkv-vllm"
-version = "0.1.0"
-description = "Sequence-axis FFT KV cache codec as a vLLM attention backend plugin"
+name = "kvcodec-vllm"
+version = "0.2.0"
+description = "Custom KV cache codecs (int4, sequence-axis FFT) as a vLLM attention backend plugin"
 requires-python = ">=3.10"
 
 [project.entry-points."vllm.general_plugins"]
-fftkv = "fftkv_vllm:register"
+kvcodec = "kvcodec:register"
 
 [tool.setuptools]
-packages = ["fftkv_vllm"]
+packages = ["kvcodec"]
 py-modules = ["custom_layers"]
