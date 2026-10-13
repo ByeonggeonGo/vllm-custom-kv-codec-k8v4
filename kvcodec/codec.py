@@ -1,18 +1,20 @@
-"""KV 캐시 코덱: (토큰, head) 벡터 하나를 4비트 또는 8비트로 압축 (순수 PyTorch, vLLM 의존 없음)
+"""KV cache codec: packs one (token, head) vector into 4 or 8 bits per value (pure PyTorch, no vLLM)
 
-한쪽(K 또는 V)의 칸 형식, head_size D 기준
-    4비트: [ 값 D/2 바이트 | lo 2 | step 2 ]   비대칭 16단계, 값 두 개를 한 바이트에 (짝수 채널 = 하위 4비트)
-    8비트: [ 값 D 바이트   | scale 2 ]         대칭 -127..127
-    lo / step / scale은 bf16
+Cell layout of one side (K or V), for head_size D
+    4-bit: [ D/2 data bytes | lo 2 | step 2 ]   asymmetric, 16 levels, two values per byte (even channel = low nibble)
+    8-bit: [ D data bytes   | scale 2 ]         symmetric, -127..127
+    lo / step / scale are bf16
 
-양자화 전 처리
-    1) 채널 평균 제거 (선택): K는 에너지의 56~90%가 토큰과 무관한 채널별 상수라, 그대로 두면 4비트
-       눈금이 그 상수를 표현하는 데 소진됨. 보정 데이터로 구한 (head, 채널) 평균을 빼고 저장
-    2) 무작위 부호 + 아다마르 회전: 소수 채널에 몰린 크기를 전 채널에 분산. 직교 변환이라 역변환 가능
+Before quantizing
+    1) channel-mean removal (optional): 56-90% of the energy of K is a per-channel constant unrelated to
+       the token; left in, it uses up the 4-bit levels. The (head, channel) mean from calibration data
+       is subtracted before storing
+    2) random sign + Hadamard rotation: spreads magnitude concentrated in a few channels over all of
+       them. Orthogonal, hence invertible
 
-모드 (K 비트, V 비트)와 캐시 칸 크기 (D=128, bf16 원본 512바이트)
-    k8v4: 130 + 68 = 198바이트 (0.387x)   보정 불필요
-    k4v4:  68 + 68 = 136바이트 (0.266x)   채널 평균 표 필요
+Modes (K bits, V bits) and cache cell size (D=128, bf16 cell 512 bytes)
+    k8v4: 130 + 68 = 198 bytes (0.387x)   no calibration
+    k4v4:  68 + 68 = 136 bytes (0.266x)   needs the channel-mean table
 """
 
 from __future__ import annotations
@@ -24,21 +26,21 @@ _ROT: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def side_bytes(head_size: int, bits: int) -> int:
-    """K 또는 V 한쪽의 칸 바이트 수"""
+    """Bytes of one side (K or V) of a cell"""
     return head_size // 2 + 4 if bits == 4 else head_size + 2
 
 
 def cell_bytes(head_size: int, mode: str) -> int:
-    """K + V 캐시 칸 바이트 수 (vLLM `state_content_bytes`)"""
+    """Bytes of a K + V cache cell (vLLM `state_content_bytes`)"""
     k_bits, v_bits = MODES[mode]
     return side_bytes(head_size, k_bits) + side_bytes(head_size, v_bits)
 
 
 def rotation(head_size: int, device) -> tuple[torch.Tensor, torch.Tensor]:
-    """(sign (D,), hadamard (D, D)). hadamard는 대칭 직교 행렬"""
+    """(sign (D,), hadamard (D, D)). hadamard is symmetric and orthogonal"""
     key = (head_size, str(device))
     if key not in _ROT:
-        assert head_size & (head_size - 1) == 0, "head_size는 2의 거듭제곱"
+        assert head_size & (head_size - 1) == 0, "head_size must be a power of two"
         h = torch.ones(1, 1)
         while h.shape[0] < head_size:
             h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
@@ -48,7 +50,7 @@ def rotation(head_size: int, device) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def pack(x: torch.Tensor, bits: int, mean: torch.Tensor | None = None) -> torch.Tensor:
-    """(..., D) 실수 -> (..., side_bytes) uint8. mean: x에 broadcast 가능한 채널 평균"""
+    """(..., D) float -> (..., side_bytes) uint8. mean: channel mean broadcastable to x"""
     x = x.float()
     if mean is not None:
         x = x - mean
@@ -71,7 +73,7 @@ def unpack(cell: torch.Tensor, bits: int, mean: torch.Tensor | None = None,
     if bits == 4:
         n = cell.shape[-1] - 4
         data = cell[..., :n]
-        q = torch.stack([data & 0xF, data >> 4], dim=-1).flatten(-2).float()  # 채널 순서 복원
+        q = torch.stack([data & 0xF, data >> 4], dim=-1).flatten(-2).float()  # restore the channel order
         lo = cell[..., n : n + 2].contiguous().view(torch.bfloat16).float()
         step = cell[..., n + 2 :].contiguous().view(torch.bfloat16).float()
         x = q * step + lo

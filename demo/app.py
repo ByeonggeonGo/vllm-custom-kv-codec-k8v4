@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""KV 캐시 코덱 비교 웹 데모 (표준 라이브러리만 사용)
+"""Web demo comparing KV cache codecs (standard library only)
 
-    demo/servers.sh up        # vLLM 서버 5개
+    demo/servers.sh up        # 5 vLLM servers
     python demo/app.py        # http://localhost:8200
 
-- 같은 질문을 선택한 서버들에 동시에 보내 답변을 SSE로 중계
-- 1초마다 서버별 GPU 프로세스 메모리(nvidia-smi)와 KV 캐시 사용률(vLLM /metrics) 수집
-- 요청별 TTFT, 생성 속도, 토큰 수, KV 캐시 점유 바이트 기록
+- sends one prompt to the selected servers and relays the answers over SSE
+- every second, collects per-server GPU process memory (nvidia-smi) and KV cache usage (vLLM /metrics)
+- records TTFT, generation speed, token counts and KV cache bytes per request
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ POOL_BYTES = int(os.environ.get("POOL_MB", 256)) * 1024 * 1024
 CORPUS_URL = "https://www.gutenberg.org/cache/epub/1342/pg1342.txt"
 CORPUS = REPO / "results" / "corpus_gutenberg.txt"
 
-# name은 servers.sh의 --served-model-name, 컨테이너는 kvdemo-<name>
+# name is the --served-model-name in servers.sh; the container is kvdemo-<name>
 SERVERS = [
     {"name": "bf16", "label": "bf16 (no compression)", "port": 8101, "ours": False,
      "note": "vLLM default KV cache"},
@@ -44,13 +44,13 @@ SERVERS = [
 ]
 BY_NAME = {s["name"]: s for s in SERVERS}
 
-HISTORY: list[dict] = []   # 1초 간격 표본 {t, servers: {name: {gpu_mib, kv_usage}}}
-RUNS: list[dict] = []      # 요청 결과
-STATIC: dict[str, dict] = {}  # 서버별 고정 정보 (수용 토큰 수 등)
+HISTORY: list[dict] = []   # samples at 1 s intervals {t, servers: {name: {gpu_mib, kv_usage}}}
+RUNS: list[dict] = []      # request results
+STATIC: dict[str, dict] = {}  # fixed per-server info (token capacity etc.)
 LOCK = threading.Lock()
 
 
-# ---------------------------------------------------------------------- 수집
+# ---------------------------------------------------------------------- collection
 def _get(url: str, timeout: float = 1.5) -> str | None:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -60,7 +60,7 @@ def _get(url: str, timeout: float = 1.5) -> str | None:
 
 
 def _metrics(port: int) -> dict | None:
-    """vLLM /metrics에서 KV 캐시 사용률과 블록 설정 추출"""
+    """KV cache usage and block settings from vLLM /metrics"""
     text = _get(f"http://localhost:{port}/metrics")
     if text is None:
         return None
@@ -126,12 +126,12 @@ def collector() -> None:
         time.sleep(1.0)
 
 
-# ---------------------------------------------------------------------- 지문
+# ---------------------------------------------------------------------- passages
 _corpus_text: str | None = None
 
 
 def passage(n_tokens: int) -> str:
-    """문맥 길이를 늘리는 데 쓰는 소설 본문. 토큰 수는 글자 수로 근사 (영문 약 4.4자/토큰)"""
+    """Novel text used to lengthen the context. Tokens are approximated by characters (~4.4 per token)"""
     global _corpus_text
     if _corpus_text is None:
         if not CORPUS.exists():
@@ -142,9 +142,9 @@ def passage(n_tokens: int) -> str:
     return _corpus_text[start : start + int(n_tokens * 4.4)]
 
 
-# ---------------------------------------------------------------------- 생성
+# ---------------------------------------------------------------------- generation
 def run_one(name: str, prompt: str, max_tokens: int, run_id: str, out: queue.Queue) -> None:
-    """서버 하나에 스트리밍 요청. 토큰과 최종 통계를 큐에 넣음"""
+    """Streamed request to one server. Puts tokens and the final stats on the queue"""
     server = BY_NAME[name]
     body = json.dumps({
         "model": name, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
@@ -176,12 +176,12 @@ def run_one(name: str, prompt: str, max_tokens: int, run_id: str, out: queue.Que
                         t_last = now
                         text.append(piece)
                         out.put({"type": "token", "server": name, "text": piece})
-                        if now - last_poll > 0.25:  # 요청 중 KV 캐시 사용률 최댓값
+                        if now - last_poll > 0.25:  # peak KV cache usage during the request
                             last_poll = now
                             m = _metrics(server["port"])
                             if m:
                                 peak = max(peak, m.get("kv_usage", 0.0))
-    except Exception as e:  # 연결 실패, 문맥 초과 등
+    except Exception as e:  # connection failure, context overflow, ...
         out.put({"type": "error", "server": name, "message": str(e)})
         out.put({"type": "done", "server": name})
         return
@@ -210,7 +210,7 @@ def run_one(name: str, prompt: str, max_tokens: int, run_id: str, out: queue.Que
 
 # ---------------------------------------------------------------------- HTTP
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args) -> None:  # 조용히
+    def log_message(self, *args) -> None:  # quiet
         pass
 
     def _json(self, obj, status: int = 200) -> None:
@@ -258,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         out: queue.Queue = queue.Queue()
-        if body.get("sequential", True):  # GPU 한 장을 나눠 쓰므로 시간 측정은 한 서버씩
+        if body.get("sequential", True):  # one GPU is shared, so servers are timed one at a time
             def chain() -> None:
                 for name in names:
                     run_one(name, prompt, max_tokens, run_id, out)

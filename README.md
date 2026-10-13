@@ -14,25 +14,29 @@ here address directly.
 Qwen3-0.6B on vLLM 0.30.0, one RTX 5080. Every server gets the same 256 MB KV cache; only the
 cache format differs.
 
-| Server | Cache cell | Tokens that fit in 256 MB | KV used, 1,695-token prompt + answer | PPL | Decode speed |
-|---|---:|---:|---:|---:|---:|
-| bf16 (vLLM default) | 512 B (1.000x) | 2,336 | 191 MB | 29.24 | 190 tok/s |
-| vLLM `int8_per_token_head` | 264 B (0.516x) | 4,528 | 98 MB | 29.92 | 197 tok/s |
-| **ours `k8v4`** | **198 B (0.387x)** | **6,048** | **74 MB** | **29.56** | 58 tok/s |
-| vLLM `int4_per_token_head` | 136 B (0.266x) | 8,800 | 50 MB | 89.14 | 117 tok/s |
-| **ours `k4v4`** | **136 B (0.266x)** | **8,800** | **51 MB** | **32.69** | 54 tok/s |
+| Server | Cache cell | Tokens that fit in 256 MB | KV used, 1,695-token prompt + answer | PPL | Decode speed | Time to first token |
+|---|---:|---:|---:|---:|---:|---:|
+| bf16 (vLLM default) | 512 B (1.000x) | 2,336 | 191 MB | 30.14 | 188 tok/s | 29 ms |
+| vLLM `int8_per_token_head` | 264 B (0.516x) | 4,528 | 98 MB | 31.04 | 190 tok/s | 38 ms |
+| **ours `k8v4`** | **198 B (0.387x)** | **6,048** | **74 MB** | **30.44** | **195 tok/s** | 52 ms |
+| vLLM `int4_per_token_head` | 136 B (0.266x) | 8,800 | 50 MB | 83.61 | 113 tok/s | 45 ms |
+| **ours `k4v4`** | **136 B (0.266x)** | **8,800** | **51 MB** | **33.61** | **191 tok/s** | 55 ms |
 
 - **Memory is really smaller.** The plugin declares a smaller cache cell, vLLM allocates the pool
   with it, and vLLM's own `kv_cache_usage_perc` metric reports the difference: the 1,695-token
   prompt occupies 74.5% of the bf16 pool, 28.9% with `k8v4`, 19.9% with `k4v4`.
 - **Quality is better than the built-ins at the same size.** `k8v4` is 25% smaller than vLLM int8
-  and closer to bf16. `k4v4` is the size of vLLM int4 with perplexity 32.7 instead of 89.1.
-- **Speed is worse.** The plugin unpacks the cache in PyTorch on every step; vLLM's formats are
-  read by Triton kernels. A kernel for this format is the next step.
+  and closer to bf16. `k4v4` is the size of vLLM int4 with perplexity 33.6 instead of 83.6.
+- **Decoding is as fast as bf16.** Triton kernels ([`kvcodec/kernel.py`](kvcodec/kernel.py)) read
+  the packed cells without unpacking them and write new tokens. With the first version, which
+  unpacked the whole context in PyTorch on every step, `k8v4` decoded at 57 tok/s.
+- **Prefill is slower.** Time to first token on a 1,682-token prompt is 52–55 ms against 29 ms for
+  bf16.
 
-PPL is measured inside vLLM on every server the same way: token log-probabilities of six
-~1,500-token passages (9,119 tokens) from `/v1/completions` with `echo`. Speed is tokens per
-second after the first token, one server running at a time, all servers eager with prefix caching off.
+All five rows come from [`demo/measure.py`](demo/measure.py). PPL is measured inside vLLM the same
+way on every server: token log-probabilities of six ~1,500-token passages (9,482 tokens) from
+`/v1/completions` with `echo`. Speed is tokens per second after the first token on a 1,682-token
+prompt, best of three, one request at a time, all servers eager with prefix caching off.
 
 ## How the codecs work
 
@@ -47,12 +51,12 @@ Three things make 4 bits usable ([`kvcodec/codec.py`](kvcodec/codec.py)):
 
 1. **Rotation.** A key vector has a few channels 100–260× larger than its median. A scale fitted to
    the maximum rounds 70–95% of the other channels to zero. Multiplying by a random-sign Hadamard
-   matrix spreads the magnitude over all 128 channels; the read path multiplies by the same matrix
-   to undo it.
+   matrix spreads the magnitude over all 128 channels. The matrix is orthogonal, so the read path
+   rotates the query instead of undoing it on every key.
 2. **Channel-mean removal** (`k4v4`). 56–90% of the energy of the keys is a per-channel constant
    that does not depend on the token. Left in, it uses up the 16 levels. A table of per-(layer,
    head, channel) means, computed once by [`kvcodec/calibrate.py`](kvcodec/calibrate.py), is
-   subtracted before quantizing and added back on read.
+   subtracted before quantizing.
 3. **Spend bits where they matter** (`k8v4`). Values tolerate 4 bits (KL 0.017 against bf16); keys
    do not (KL 1.42). Keys get 8 bits, values 4.
 
@@ -76,11 +80,41 @@ flowchart LR
     B --> S["customize_spec()<br/>cell = 198 or 136 bytes"]
     S --> A["vLLM allocates the pool<br/>with that cell size"]
     A --> W["do_kv_cache_update()<br/>pack new tokens into pages"]
-    W --> F["forward()<br/>unpack pages, attention"]
+    W --> F["forward()<br/>attention on packed pages"]
 ```
 
 [`kvcodec/backend.py`](kvcodec/backend.py) subclasses vLLM's Triton backend and overrides three things:
 `customize_spec` (cell size), `do_kv_cache_update` (write) and `forward` (read).
+
+## The kernels
+
+[`kvcodec/kernel.py`](kvcodec/kernel.py) never reconstructs a key or a value. With `c` the stored
+integer codes, `R` the rotation and `q_rot = R q`:
+
+```
+score    q · k  =  q_rot · k_rot + q · mean_k
+                =  step · (q_rot · c) + lo · sum(q_rot)  + const     one dot product with the codes
+output   Σ p_t v_t  =  Rᵀ (Σ p_t v_rot_t) + mean_v                   accumulate rotated, undo once
+```
+
+- `q · mean_k` is the same for every key of a query, so it cancels in the softmax: the key mean
+  table is only needed when writing.
+- The query is rotated once per step and the output un-rotated once, whatever the context length.
+- Packed int4 is read as low nibbles then high nibbles; the channel order this implies is folded
+  into the two rotation matrices, so the kernel does no interleaving.
+- Decoding has one query per sequence and would use 8 GPU programs. The context is split into 16
+  segments computed in parallel, and a second small kernel merges their softmax states.
+- The write kernel rotates, quantizes and packs new tokens; its output is byte-identical to
+  `codec.pack`.
+
+| One decode step, one layer, 2,000-token context | PyTorch (v1) | Triton |
+|---|---:|---:|
+| read `k8v4` | 225 µs | 47 µs |
+| write `k8v4` | 143 µs | 10 µs |
+
+`python -m kvcodec.kernel_check` checks both kernels against the PyTorch codec (mixed prefill and
+decode batches, both modes) and prints these timings. `KVCODEC_READ=torch` / `KVCODEC_WRITE=torch`
+switch the server back to the PyTorch paths.
 
 ## Running it
 
@@ -106,17 +140,22 @@ KVCODEC=k4v4 KVCODEC_MEAN=results/kv_mean_qwen3-0.6b.pt vllm serve Qwen/Qwen3-0.
 | Path | Contents |
 |---|---|
 | `kvcodec/codec.py` | pack / unpack, rotation, cell sizes (pure PyTorch) |
+| `kvcodec/kernel.py` | Triton kernels: attention on packed cells, write |
+| `kvcodec/kernel_check.py` | kernel correctness and timing against the PyTorch codec |
 | `kvcodec/backend.py` | vLLM attention backend for `k8v4` / `k4v4` |
 | `kvcodec/calibrate.py` | channel-mean table for `k4v4` |
 | `kvcodec/fft_backend.py` | the FFT codec as a backend (quality only, no memory saving) |
 | `demo/servers.sh`, `demo/app.py`, `demo/index.html` | servers and the web bench |
+| `demo/measure.py` | perplexity, decode speed and time to first token for the table above |
 
 ## Limits
 
 - Tested on vLLM 0.30.0 only. `customize_spec` is marked a temporary API in vLLM's source.
 - Eager mode, prefix caching off. CUDA graphs and prefix caching are untested with the plugin.
-- The read path is PyTorch and unpacks the whole context every step: about 3× slower than bf16.
-  The plugin process also holds a few hundred MiB of scratch tensors.
+- The kernels implement causal attention only: no sliding window, ALiBi, attention sinks or soft
+  cap. Dot products use TF32 tensor cores like vLLM's kernels (`KVCODEC_DOT=ieee` for exact
+  float32, about 2.7× slower prefill).
+- Prefill is about 1.8× slower than bf16.
 - `k4v4` needs a calibration table per model; the keys are post-RoPE, so the table should be built
   with windows at least as long as the contexts served.
 - One 0.6B model, one book for perplexity. Both 4-bit formats (vLLM's and this one) break on very

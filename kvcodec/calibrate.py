@@ -1,11 +1,12 @@
-"""k4v4 모드용 채널 평균 표 생성 (Hugging Face 경로, vLLM 불필요)
+"""Build the channel-mean table for k4v4 (Hugging Face path, no vLLM)
 
     python -m kvcodec.calibrate --model Qwen/Qwen3-0.6B --text results/corpus_gutenberg.txt \\
         --out results/kv_mean_qwen3-0.6b.pt
 
-- 레이어별 K/V의 (head, 채널) 평균을 토큰·배치에 대해 계산
-- 캐시의 K는 RoPE 적용 후 값이라 평균이 위치 범위에 따라 달라짐 → 데모에서 쓸 문맥 길이만큼 긴 창으로 보정
-- 저장 형식: {"k": (L, H, D), "v": (L, H, D), "seq_len": int, "n_tokens": int}
+- per-layer (head, channel) mean of K and V over tokens and batches
+- cached K is post-RoPE, so its mean depends on the position range -> calibrate with windows as long
+  as the contexts served in the demo
+- file format: {"k": (L, H, D), "v": (L, H, D), "seq_len": int, "n_tokens": int}
 """
 
 from __future__ import annotations

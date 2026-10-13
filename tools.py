@@ -54,7 +54,7 @@ __all__ = [
 CACHE_DIR = Path(__file__).parent / "results"
 
 
-# --------------------------------------------------------------------- 기본
+# --------------------------------------------------------------------- basics
 def set_seed(seed: int = 0) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -62,7 +62,7 @@ def set_seed(seed: int = 0) -> None:
 
 
 def load_model(model_id: str = "Qwen/Qwen3-0.6B", device: str = "cuda", dtype=torch.bfloat16):
-    """모델 로드 후 **모든 파라미터 freeze**. 학습 대상은 selector뿐"""
+    """Load the model, then **freeze all parameters**. Only the selector is trained"""
     tok = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(device).eval()
     for p in model.parameters():
@@ -85,17 +85,17 @@ def describe_model(model) -> dict:
     }
 
 
-# --------------------------------------------------------------------- 데이터
+# --------------------------------------------------------------------- data
 _SOURCES = {
-    # Project Gutenberg, Pride and Prejudice. 일반 영어 산문
+    # Project Gutenberg, Pride and Prejudice. Plain English prose
     "gutenberg": ("url", "https://www.gutenberg.org/cache/epub/1342/pg1342.txt"),
-    # HF hub의 평문 txt. datasets 패키지 없이 다운로드 가능
+    # Plain-text txt on the HF hub. Downloadable without the datasets package
     "tinystories": ("hf", ("roneneldan/TinyStories", "TinyStories-valid.txt")),
 }
 
 
 def load_text(source: str = "gutenberg") -> str:
-    """코퍼스를 문자열로 반환. 파일 경로를 주면 해당 파일을 읽음"""
+    """Return the corpus as a string. Given a file path, read that file"""
     if os.path.exists(source):
         return Path(source).read_text(encoding="utf-8", errors="ignore")
 
@@ -129,14 +129,14 @@ def make_batches(
     seed: int = 0,
     skip_chars: int = 5000,
 ) -> list[torch.Tensor]:
-    """연속 토큰 스트림을 겹치지 않는 (B, S) 조각으로 분할
+    """Split a continuous token stream into non-overlapping (B, S) chunks
 
-    앞부분 `skip_chars`는 Gutenberg 헤더 등 본문 외 영역이라 제외
+    The leading `skip_chars` are excluded as non-body text (Gutenberg header etc.)
     """
     ids = tok(text[skip_chars:], return_tensors="pt").input_ids[0]
     need = seq_len * batch_size * n_batches
     if ids.numel() < need:
-        raise ValueError(f"토큰 부족: {ids.numel()} < {need}. seq_len 또는 n_batches 축소 필요")
+        raise ValueError(f"not enough tokens: {ids.numel()} < {need}. reduce seq_len or n_batches")
     ids = ids[:need].view(n_batches, batch_size, seq_len)
     order = torch.randperm(n_batches, generator=torch.Generator().manual_seed(seed))
     return [ids[i].to(device) for i in order]
@@ -144,7 +144,7 @@ def make_batches(
 
 # --------------------------------------------------------------------- forward
 def forward_logits(model, ids: torch.Tensor, cache=None) -> torch.Tensor:
-    """(B, S) -> (B, S, V). cache가 None이면 압축 없는 원본 경로"""
+    """(B, S) -> (B, S, V). cache=None is the uncompressed original path"""
     out = model(input_ids=ids, past_key_values=cache, use_cache=cache is not None)
     return out.logits
 
@@ -155,20 +155,20 @@ def teacher_logits(model, ids: torch.Tensor) -> torch.Tensor:
 
 
 def distill_loss(teacher: torch.Tensor, student: torch.Tensor) -> torch.Tensor:
-    """토큰 평균 KL(teacher || student). teacher는 detach된 상태 전제"""
+    """Token-mean KL(teacher || student). Assumes the teacher is detached"""
     t_logp = F.log_softmax(teacher.float(), dim=-1)
     s_logp = F.log_softmax(student.float(), dim=-1)
     return F.kl_div(s_logp, t_logp, log_target=True, reduction="batchmean") / teacher.shape[1]
 
 
 def token_nll(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-    """다음 토큰 예측 NLL (nats/token). perplexity = exp(이 값)"""
+    """Next-token NLL (nats/token). perplexity = exp(this value)"""
     pred = logits[:, :-1].float().reshape(-1, logits.shape[-1])
     target = ids[:, 1:].reshape(-1)
     return F.cross_entropy(pred, target)
 
 
-# ---------------------------------------------------------------------- 평가
+# ---------------------------------------------------------------------- eval
 @torch.no_grad()
 def evaluate(
     model,
@@ -179,7 +179,7 @@ def evaluate(
     threshold: float = 0.5,
     collect_usage: bool = True,
 ) -> dict:
-    """teacher 대비 KL / top-1 일치율 / perplexity / 평균 mask 사용률"""
+    """KL vs teacher / top-1 agreement / perplexity / mean mask usage"""
     if compressor is not None:
         prev = (compressor.mode, compressor.keep_ratio, compressor.threshold, compressor.collect)
         compressor.mode, compressor.keep_ratio, compressor.threshold = mode, keep_ratio, threshold
@@ -218,12 +218,12 @@ def evaluate(
     return result
 
 
-# ------------------------------------------------------------------ 가설 점검
+# ------------------------------------------------------------------ hypothesis check
 class _SpectrumProbe(DynamicCache):
-    """압축은 하지 않고, 레이어별 K/V의 rFFT 크기만 모으는 캐시
+    """Cache that does not compress; only collects per-layer rFFT magnitudes of K/V
 
-    axis="head": 토큰·head마다 D차원 벡터를 FFT. 샘플 하나 = (b, h, s), F = D//2+1
-    axis="seq":  head·채널마다 길이 S 시계열을 FFT. 샘플 하나 = (b, h, d), F = S//2+1
+    axis="head": FFT the D-dim vector per token and head. One sample = (b, h, s), F = D//2+1
+    axis="seq":  FFT the length-S time series per head and channel. One sample = (b, h, d), F = S//2+1
     """
 
     def __init__(self, config=None, axis: str = "head"):
@@ -246,17 +246,17 @@ class _SpectrumProbe(DynamicCache):
 
 @torch.no_grad()
 def spectrum_stats(model, ids: torch.Tensor, axis: str = "head", drop_dc: bool = False) -> dict:
-    """K/V가 FFT basis에서 sparse한지 확인하는 통계
+    """Statistics for checking whether K/V are sparse in the FFT basis
 
-    axis: "head"면 head_dim 축, "seq"면 sequence 축으로 FFT (`_SpectrumProbe`)
-    drop_dc: bin 0 제외 후 계산. seq 축의 DC는 채널별 시간 평균이라, 채널 bias가 큰 K에서는
-             DC 하나에 에너지가 몰려 실제보다 sparse하게 보이는 문제 방지
+    axis: "head" = FFT along head_dim, "seq" = along the sequence axis (`_SpectrumProbe`)
+    drop_dc: compute after excluding bin 0. The seq-axis DC is the per-channel time mean, so for K with a
+             large channel bias the energy piles into DC alone and looks sparser than it is; this avoids that
 
-    반환:
-        mean_mag[(layer, which)]   주파수별 평균 |계수| (F,)
-        energy_curve[(layer, which)] 크기 순 상위 m개를 남겼을 때 보존되는 에너지
-                                     비율 (F,). 1에 빨리 가까워질수록 sparse
-        n_freq                     F. axis="seq"면 ids 길이에 따라 변동
+    Returns:
+        mean_mag[(layer, which)]   mean |coef| per frequency (F,)
+        energy_curve[(layer, which)] fraction of energy kept when retaining the top m
+                                     by magnitude (F,). The faster it approaches 1, the sparser
+        n_freq                     F. With axis="seq" it varies with the ids length
     """
     probe = _SpectrumProbe(config=model.config, axis=axis)
     forward_logits(model, ids, cache=probe)
@@ -282,7 +282,7 @@ def layer_sensitivity(
     mode: str = "energy",
     targets=("k", "v"),
 ) -> list[dict]:
-    """한 번에 한 레이어만 압축해 KL 측정. 민감한 레이어 탐색용"""
+    """Compress one layer at a time and measure KL. For finding sensitive layers"""
     rows = []
     saved = (compressor.active_layers, compressor.targets)
     for layer in range(compressor.num_layers):
@@ -295,7 +295,7 @@ def layer_sensitivity(
     return rows
 
 
-# ---------------------------------------------------------------------- 학습
+# ---------------------------------------------------------------------- training
 def train_selectors(
     model,
     compressor: KVFreqCompressor,
@@ -312,18 +312,18 @@ def train_selectors(
     log_every: int = 10,
     grad_clip: float = 1.0,
 ) -> list[dict]:
-    """selector만 업데이트. 모델 weight는 freeze 상태 유지
+    """Update the selector only. Model weights stay frozen
 
     L = KL(teacher || student) + lambda_sparse * mask.mean()
                                + lambda_budget * relu(mask.mean() - target_ratio)^2
 
-    - Stage 1: `mode="soft"` + sparsity/budget 항으로 사용량 학습
-    - Stage 2: `mode="topk", keep_ratio=r`로 비율 고정, 선택 대상만 학습. mask가 0/1이라
-      sparsity 항이 상수가 되므로 보통 `lambda_sparse=0, target_ratio=None`
-    - `straight_through=True`: hard mask에 soft gradient를 전달해 top-k 선택도 학습 가능
-    - `target_ratio=None`: budget 항 비활성화
-    - sparsity/budget 계수는 처음 `warmup` 스텝 동안 0에서 선형 증가. 초기 mask가 1에
-      가까워 budget 항 기울기가 큰 탓. 램프 없이 학습 시 첫 스텝에서 selector 붕괴
+    - Stage 1: `mode="soft"` + sparsity/budget terms to learn usage
+    - Stage 2: `mode="topk", keep_ratio=r` fixes the ratio and learns only what to select. The mask is 0/1,
+      so the sparsity term is constant; usually `lambda_sparse=0, target_ratio=None`
+    - `straight_through=True`: passes the soft gradient through the hard mask, so top-k selection is trainable too
+    - `target_ratio=None`: disables the budget term
+    - sparsity/budget coefficients ramp linearly from 0 over the first `warmup` steps, because the initial mask
+      is near 1 and the budget-term gradient is large. Without the ramp the selector collapses on the first step
       (KL 0.003 → 1.2)
     """
     optim = torch.optim.AdamW(compressor.trainable_parameters(), lr=lr)
@@ -380,7 +380,7 @@ def sweep_ratios(
     ratios=(1.0, 0.875, 0.75, 0.5, 0.25, 0.125, 0.0625),
     modes=("topk", "energy", "lowpass", "random"),
 ) -> list[dict]:
-    """compression ratio x 선택 방식 격자를 평가해 `plot_tradeoff` 입력 형식의 행 목록으로 반환"""
+    """Evaluate a compression ratio x selection method grid; returns a list of rows in `plot_tradeoff` input format"""
     rows = []
     for mode in modes:
         for ratio in ratios:
@@ -393,21 +393,21 @@ def sweep_ratios(
     return rows
 
 
-# ------------------------------------------------- sequence 축 압축 (prefix 방식)
+# ------------------------------------------------- sequence-axis compression (prefix scheme)
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 
 def _rope_cos_sin(model, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """like: (B, H, S, D) -> 위치 0..S-1의 cos, sin (1, 1, S, D), float32"""
+    """like: (B, H, S, D) -> cos, sin of positions 0..S-1 (1, 1, S, D), float32"""
     pos = torch.arange(like.shape[-2], device=like.device)[None]
     cos, sin = model.model.rotary_emb(like.float(), pos)
     return cos.float()[:, None], sin.float()[:, None]
 
 
 def _keep_for(keep_ratio, which: str) -> float:
-    """keep_ratio는 float 하나, 또는 K/V 따로 주는 (k, v) 튜플"""
+    """keep_ratio is a single float, or a (k, v) tuple giving K/V separately"""
     if isinstance(keep_ratio, (tuple, list)):
         return keep_ratio[0] if which == "k" else keep_ratio[1]
     return keep_ratio
@@ -429,18 +429,18 @@ def compress_cache_(
     train: bool = False,
     tau: float = 1.0,
 ) -> tuple[int, int]:
-    """채워진 DynamicCache의 K/V를 제자리에서 저장 포맷으로 변환 후 복원
+    """Convert the K/V of a filled DynamicCache to the storage format in place, then reconstruct
 
-    mode: "lowpass" | "energy" | "random" | "learned"  sequence 축 (`seq_codec`)
-          "head"                                       head_dim 축 energy (2~8절 방식)
-          "raw"                                        FFT 없이 양자화만 (`raw_codec`, group=block)
-    keep_ratio: float, 또는 K/V에 따로 줄 (k, v) 튜플
-    coef: 계수(raw면 값) 저장 형식. "bf16" | "int8" | "int4" | "int2"
-    coef_group: sequence 축 계수 양자화에서 scale을 공유하는 계수 개수 (`seq_codec`)
-    coef_asym: 계수 양자화를 비대칭 min-max로 수행 (`seq_codec`)
-    pre_rope: K의 RoPE 회전을 풀고 압축한 뒤 재회전
-    train: learned 모드에서 STE 경로(`seq_filter_ste`)로 gradient 전달. 바이트 계산 생략
-    반환: (저장 바이트, 원본 bf16 바이트). 압축 대상이 아닌 레이어/K·V는 원본 크기로 계산
+    mode: "lowpass" | "energy" | "random" | "learned"  sequence axis (`seq_codec`)
+          "head"                                       head_dim-axis energy (method of Sections 2-8)
+          "raw"                                        quantization only, no FFT (`raw_codec`, group=block)
+    keep_ratio: float, or a (k, v) tuple giving K/V separately
+    coef: storage format of coefficients (values if raw). "bf16" | "int8" | "int4" | "int2"
+    coef_group: number of coefficients sharing one scale in sequence-axis coefficient quantization (`seq_codec`)
+    coef_asym: quantize coefficients with asymmetric min-max (`seq_codec`)
+    pre_rope: undo K's RoPE rotation, compress, then re-rotate
+    train: in learned mode, pass gradients through the STE path (`seq_filter_ste`). Skips byte accounting
+    Returns: (stored bytes, original bf16 bytes). Layers / K·V not targeted for compression count at original size
     """
     stored = original = 0
     for layer_idx, layer in enumerate(cache.layers):
@@ -479,7 +479,7 @@ def compress_cache_(
 
 
 def _prefix_student(model, ids, prefix, mode, train=False, **compress_kwargs):
-    """앞 prefix 토큰으로 캐시 채움 -> 압축 -> 뒤쪽 토큰 forward. (logits, 저장 바이트, 원본 바이트)"""
+    """Fill the cache with the leading prefix tokens -> compress -> forward the trailing tokens. (logits, stored bytes, original bytes)"""
     cache = DynamicCache(config=model.config)
     with torch.no_grad():
         model(input_ids=ids[:, :prefix], past_key_values=cache, use_cache=True)
@@ -502,13 +502,13 @@ def evaluate_prefix(
     mode: str = "energy",
     **compress_kwargs,
 ) -> dict:
-    """과거(prefix)는 압축 캐시, 뒤쪽 토큰은 원본으로 예측해 teacher와 비교
+    """Past (prefix) is a compressed cache, trailing tokens stay original; predict them and compare with the teacher
 
-    1) ids[:, :prefix]로 캐시 채움  2) `compress_cache_`로 압축·복원
-    3) ids[:, prefix:]를 그 캐시 위에서 forward. 지표는 뒤쪽 토큰에서만 측정
-    - sequence 축 필터는 블록 안 뒤 토큰 정보를 앞 토큰에 섞음. query가 자신보다 과거인
-      압축 블록만 참조하므로 미래 정보 누설 없음
-    - `bytes` = 압축 구간(prefix)의 저장 바이트 / 원본 bf16 바이트. 실제 저장 텐서 기준
+    1) fill the cache with ids[:, :prefix]  2) compress and reconstruct with `compress_cache_`
+    3) forward ids[:, prefix:] on top of that cache. Metrics are measured on the trailing tokens only
+    - The sequence-axis filter mixes later-token information into earlier tokens within a block. A query only
+      attends to compressed blocks in its own past, so no future information leaks
+    - `bytes` = stored bytes of the compressed span (prefix) / original bf16 bytes. Based on the actual stored tensors
     """
     totals = {"kl": 0.0, "agree": 0.0, "nll": 0.0, "nll_teacher": 0.0}
     stored_sum = original_sum = 0
@@ -535,10 +535,10 @@ def evaluate_prefix(
 
 @torch.no_grad()
 def evaluate_window(model, batches: list[torch.Tensor], prefix: int, window: int) -> dict:
-    """대조군: 과거를 압축하지 않고 최근 `window`개 토큰만 남기고 나머지는 폐기
+    """Control: no compression of the past; keep only the last `window` tokens and discard the rest
 
-    - ids[:, prefix-window:]만 새로 forward, 뒤쪽 토큰 지표를 teacher(전체 문맥)와 비교
-    - window=0이면 과거 없이 뒤쪽 토큰만 실행 = 압축 방식이 넘어야 할 바닥값
+    - forward only ids[:, prefix-window:] afresh; compare trailing-token metrics with the teacher (full context)
+    - window=0 runs only the trailing tokens with no past = the floor a compression method must beat
     - bytes = window / prefix
     """
     totals = {"kl": 0.0, "agree": 0.0, "nll": 0.0, "nll_teacher": 0.0}
@@ -560,7 +560,7 @@ def evaluate_window(model, batches: list[torch.Tensor], prefix: int, window: int
 
 
 def sweep_prefix(model, batches, prefix, ratios, modes, label=None, **compress_kwargs) -> list[dict]:
-    """`evaluate_prefix`를 mode x ratio 격자로 실행해 `plot_tradeoff` 입력 형식의 행 목록을 반환"""
+    """Run `evaluate_prefix` over a mode x ratio grid; returns a list of rows in `plot_tradeoff` input format"""
     rows = []
     for mode in modes:
         for ratio in ratios:
@@ -584,10 +584,10 @@ def train_seq_selector(
     log_every: int = 20,
     **compress_kwargs,
 ) -> list[dict]:
-    """sequence 축 selector 학습. prefix 방식과 동일하게 압축된 과거 위에서 뒤쪽 토큰의 KL 최소화
+    """Train the sequence-axis selector. As in the prefix scheme, minimize trailing-token KL on top of the compressed past
 
-    - 모델 weight는 freeze. gradient 경로: 뒤쪽 토큰 forward -> 압축된 K/V -> STE mask -> bias
-    - 앞쪽 prefill은 no_grad라 메모리는 뒤쪽 토큰 길이에만 비례
+    - Model weights frozen. Gradient path: trailing-token forward -> compressed K/V -> STE mask -> bias
+    - The leading prefill is no_grad, so memory scales only with the trailing-token length
     """
     optim = torch.optim.Adam(selector.parameters(), lr=lr)
     history, step = [], 0
@@ -609,7 +609,7 @@ def train_seq_selector(
     return history
 
 
-# ------------------------------------------------------------------ 생성/지연
+# ------------------------------------------------------------------ generation/latency
 @torch.no_grad()
 def greedy_generate(
     model,
@@ -619,7 +619,7 @@ def greedy_generate(
     make_cache=None,
     chat: bool = True,
 ) -> dict:
-    """같은 프롬프트를 원본 캐시와 압축 캐시로 각각 디코딩해 비교하기 위한 루프"""
+    """Loop for decoding the same prompt with the original cache and a compressed cache, for comparison"""
     if chat:
         prompt = tok.apply_chat_template(
             [{"role": "user", "content": prompt}],
@@ -660,9 +660,9 @@ def greedy_generate(
     }
 
 
-# ------------------------------------------------------------------ 메모리 계산
+# ------------------------------------------------------------------ memory accounting
 def dense_kv_bytes(info: dict, seq_len: int, layers: int | None = None, elem_bytes: int = 2) -> int:
-    """현재 방식의 KV cache 바이트. K와 V 모두 포함"""
+    """KV cache bytes of the current scheme. Includes both K and V"""
     layers = layers or info["layers"]
     return layers * 2 * info["kv_heads"] * info["head_dim"] * seq_len * elem_bytes
 
@@ -675,15 +675,15 @@ def spectral_kv_bytes(
     coef_bytes: int = 2,
     index_scheme: str = "bitmask",
 ) -> int:
-    """(index + complex 계수)만 저장할 때의 바이트
+    """Bytes when storing only (index + complex coefficients)
 
-    계수 하나는 실수부/허수부 두 값이라 `2 * coef_bytes`. 선택한 주파수 위치 저장 방식은 두 가지
+    One coefficient is two values (real/imag), hence `2 * coef_bytes`. Two ways to store the selected frequency positions
 
-    index   : 고른 주파수 번호를 int16으로 keep개. 구현은 단순하나 keep에 비례해 증가
-    bitmask : F비트 비트마스크 하나. keep과 무관하게 ceil(F/8) 바이트
+    index   : the chosen frequency numbers as int16, keep of them. Simple to implement but grows with keep
+    bitmask : a single F-bit bitmask. ceil(F/8) bytes regardless of keep
 
-    keep이 크면 bitmask, 아주 작으면 index가 유리. 이 오버헤드로 계수를 절반 남겨도
-    메모리는 절반 이상
+    bitmask wins for large keep, index for very small keep. With this overhead, keeping half the
+    coefficients still costs more than half the memory
     """
     layers = layers or info["layers"]
     n_freq = info["n_freq"]
@@ -697,7 +697,7 @@ def spectral_kv_bytes(
     return layers * 2 * info["kv_heads"] * seq_len * per_vector
 
 
-# ------------------------------------------------------------------ 그림
+# ------------------------------------------------------------------ figures
 def plot_training(history: list[dict], ax=None):
     import matplotlib.pyplot as plt
 
@@ -715,7 +715,7 @@ def plot_training(history: list[dict], ax=None):
 
 
 def plot_tradeoff(rows: list[dict], x="keep_ratio", ax=None):
-    """compression ratio 대 KL / perplexity. 여러 mode를 한 그림에 겹쳐 표시"""
+    """compression ratio vs KL / perplexity. Multiple modes overlaid in one figure"""
     import matplotlib.pyplot as plt
 
     if ax is None:

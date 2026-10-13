@@ -106,9 +106,8 @@ th { color: var(--text2); font-weight: 500; }
   </div>
   <div class="legend" id="legend"></div>
   <p class="foot">All servers run eagerly with prefix caching off. "ours" = the kvcodec plugin in this repo: it shrinks the cache cell and
-  decodes it in PyTorch on every step, so it is slower than vLLM's Triton kernels. GPU memory stays flat because vLLM allocates the whole pool at startup;
-  the pool holds more tokens under a smaller cell. The plugin servers sit a few hundred MiB higher after their first request: that is PyTorch
-  keeping the scratch tensors used to unpack the cache, not the cache itself.</p>
+  reads it with its own Triton kernel, without unpacking. GPU memory stays flat because vLLM allocates the whole pool at startup;
+  the pool holds more tokens under a smaller cell.</p>
 </main>
 <div class="tip" id="tip"></div>
 
@@ -121,7 +120,7 @@ const CTX = [0, 128, 256, 512, 1024, 1600];
 let servers = [], history = [], runs = [], since = 0, poolMb = 256, busy = false;
 const selected = new Set(JSON.parse(localStorage.getItem('sel') || 'null') || ['bf16', 'vllm-int4', 'ours-k8v4', 'ours-k4v4']);
 
-// ---------------------------------------------------------------- 서버 카드
+// ---------------------------------------------------------------- server cards
 function renderCards() {
   const maxCap = Math.max(1, ...servers.map(s => s.capacity_tokens || 0));
   const last = history[history.length - 1];
@@ -147,7 +146,7 @@ function renderCards() {
   $('#legend').innerHTML = servers.map(s => `<span><i class="dot" style="background:${color(s.name)}"></i>${s.label}</span>`).join('');
 }
 
-// ---------------------------------------------------------------- 선 그래프
+// ---------------------------------------------------------------- line charts
 function lineChart(svg, series, opt) {
   const W = svg.clientWidth || 400, H = 230, m = { l: 46, r: 14, t: 10, b: 26 };
   const pts = series.flatMap(s => s.points);
@@ -191,7 +190,7 @@ function drawAll() {
   lineChart($('#c-kv'), timeSeries(v => v.kv_usage * poolMb), { time: true, unit: 'MB' });
   lineChart($('#c-gpu'), timeSeries(v => v.gpu_mib), { time: true, unit: 'MiB' });
   const runSeries = (key) => shown.map(s => {
-    const byLen = new Map();   // 같은 프롬프트 길이는 최신 값만
+    const byLen = new Map();   // latest value per prompt length
     for (const r of runs) if (r.server === s.name && r[key] != null) byLen.set(r.prompt_tokens, r[key]);
     return { label: s.label, color: color(s.name), points: [...byLen].sort((a, b) => a[0] - b[0]).map(([x, y]) => ({ x, y })) };
   });
@@ -205,7 +204,7 @@ function drawAll() {
     : `<p class="sub" style="padding:24px 0;text-align:center">${empty}</p>`;
 }
 
-// ---------------------------------------------------------------- 상태 폴링
+// ---------------------------------------------------------------- status polling
 async function poll() {
   try {
     const s = await (await fetch('/api/state?since=' + since)).json();
@@ -218,7 +217,7 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
-// ---------------------------------------------------------------- 생성
+// ---------------------------------------------------------------- generation
 function outBoxes(names) {
   $('#outs').innerHTML = names.map(n => { const s = servers.find(x => x.name === n);
     return `<div class="panel out" id="o-${n}"><div class="head"><i class="dot" style="background:${color(n)}"></i>${s.label}</div><pre></pre><div class="stats"></div></div>`; }).join('');
@@ -254,7 +253,7 @@ $('#run').onclick = () => guard(async () => { $('#status').textContent = 'runnin
 $('#sweep').onclick = () => guard(async () => { for (const c of CTX) { $('#status').textContent = `sweep: ~${c} context tokens`; $('#ctx').value = c; await generate(c); } $('#status').textContent = 'sweep done'; });
 window.onresize = () => drawAll();
 poll();
-// 주소에 #autorun을 붙이면 서버 상태를 받은 뒤 한 번 실행 (스크린샷용)
+// append #autorun to the URL to run once after the server status arrives (for screenshots)
 if (location.hash === '#autorun') { const t = setInterval(() => { if (servers.length) { clearInterval(t); $('#run').click(); } }, 300); }
 </script>
 </body>

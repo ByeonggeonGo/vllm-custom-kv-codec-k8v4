@@ -1,24 +1,24 @@
-"""vLLM Triton attention 백엔드에 sequence 축 FFT 코덱을 끼운 CUSTOM 백엔드
+"""CUSTOM backend that inserts the sequence-axis FFT codec into vLLM's Triton attention backend
 
-동작
-- vLLM 블록 크기를 FFT 블록 길이와 같게 실행 (`--block-size 256`) → vLLM 블록 하나 = FFT 블록 하나
-- 블록이 가득 차고 그 토큰들이 전부 과거(context)가 된 시점에 해당 블록의 K/V를 `seq_codec`으로
-  저장 포맷으로 변환 후 복원, 캐시에 다시 기록
-- 덜 찬 마지막 블록과 이번 스텝의 새 토큰은 원본 유지
-- attention 계산은 부모(Triton 커널) 그대로
+How it works
+- run vLLM with a block size equal to the FFT block length (`--block-size 256`) -> one vLLM block = one FFT block
+- once a block is full and all its tokens are in the past (context), its K/V are converted to the
+  storage format by `seq_codec`, restored, and written back to the cache
+- the partial last block and the new tokens of the current step stay uncompressed
+- attention itself is the parent (Triton kernel), unchanged
 
-한계 (v1)
-- 캐시 텐서는 여전히 bf16. 저장 포맷의 바이트는 `seq_codec`이 센 값으로 집계만 함 (stats 파일)
-- 품질(출력)은 압축 포맷 그대로 저장했을 때와 동일, 실제 GPU 메모리 절감은 미구현
+Limits (v1)
+- the cache tensor is still bf16. Bytes of the storage format are only counted by `seq_codec` (stats file)
+- quality (outputs) equals storing the compressed format; the real GPU memory saving is not implemented
 
-환경변수
-- FFTKV_MODE      learned | energy | lowpass | off   (기본 energy, selector 지정 시 learned)
-- FFTKV_KEEP      남길 계수 비율 (기본 0.25)
-- FFTKV_COEF      bf16 | int8 | int4 | int2          (기본 int4)
-- FFTKV_COEF_GROUP scale 공유 계수 개수              (기본 8)
-- FFTKV_SELECTOR  SeqFreqSelector state_dict 경로 (.pt)
-- FFTKV_SKIP_BLOCKS 시퀀스 앞쪽에서 압축하지 않을 블록 수 (기본 0)
-- FFTKV_STATS     통계 json 경로
+Environment variables
+- FFTKV_MODE      learned | energy | lowpass | off   (default energy, learned when a selector is given)
+- FFTKV_KEEP      fraction of coefficients kept (default 0.25)
+- FFTKV_COEF      bf16 | int8 | int4 | int2          (default int4)
+- FFTKV_COEF_GROUP number of coefficients sharing a scale (default 8)
+- FFTKV_SELECTOR  path of a SeqFreqSelector state_dict (.pt)
+- FFTKV_SKIP_BLOCKS blocks at the start of a sequence left uncompressed (default 0)
+- FFTKV_STATS     path of the stats json
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ class CodecConfig:
         )
 
 
-# 프로세스 전체 집계 (레이어 인스턴스들이 공유)
+# process-wide totals (shared by the layer instances)
 _STATS = {"blocks": 0, "raw_bytes": 0, "stored_bytes": 0}
 _SELECTOR_STATE: dict[str, torch.Tensor] | None = None
 
@@ -76,13 +76,13 @@ class FFTKVAttentionImpl(TritonAttentionImpl):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._cfg = CodecConfig.from_env()
-        self._done: torch.Tensor | None = None  # (num_blocks,) 이미 압축한 블록 표시
+        self._done: torch.Tensor | None = None  # (num_blocks,) marks blocks already compressed
         self._layer_idx: int | None = None
         self._bias: dict[str, torch.Tensor | None] = {}
 
-    # ------------------------------------------------------------------ 쓰기
+    # ------------------------------------------------------------------ write
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
-        # 블록의 0번 슬롯에 새 토큰이 쓰이면 그 블록은 새로 할당된 것 → 압축 표시 해제
+        # a new token in slot 0 means the block was newly allocated -> clear its compressed mark
         if self._done is not None:
             block_size = kv_cache.shape[2]
             fresh = slot_mapping[(slot_mapping >= 0) & (slot_mapping % block_size == 0)] // block_size
@@ -90,7 +90,7 @@ class FFTKVAttentionImpl(TritonAttentionImpl):
                 self._done[fresh] = False
         return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
 
-    # ------------------------------------------------------------------ 읽기
+    # ------------------------------------------------------------------ read
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, *args, **kwargs):
         if attn_metadata is not None and self._cfg.mode != "off" and kv_cache.numel() > 0:
             self._compress_full_blocks(layer, kv_cache, attn_metadata)
@@ -98,7 +98,7 @@ class FFTKVAttentionImpl(TritonAttentionImpl):
 
     @torch.no_grad()
     def _compress_full_blocks(self, layer, kv_cache: torch.Tensor, md) -> None:
-        """kv_cache: (num_blocks, H, block_size, 2 * head_size). 과거가 된 가득 찬 블록만 처리"""
+        """kv_cache: (num_blocks, H, block_size, 2 * head_size). Only full blocks that are in the past"""
         cfg = self._cfg
         block_size = kv_cache.shape[2]
         if self._done is None or self._done.shape[0] != kv_cache.shape[0]:
