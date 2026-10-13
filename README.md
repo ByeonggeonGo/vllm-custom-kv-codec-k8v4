@@ -1,11 +1,12 @@
-# fft-based-kv-memory-compression
+# vllm-custom-kv-codec-k8v4
 
-Custom KV-cache codecs for vLLM, shipped as a plugin, with a web bench that runs them next to
-vLLM's built-in cache formats and plots memory and timing live.
+Custom KV-cache codecs for vLLM (`k8v4`, `k4v4`), shipped as a plugin with their own Triton
+kernels, and a web bench that runs them next to vLLM's built-in cache formats and plots memory
+and timing live.
 
-The repo started as an attempt to compress the KV cache with FFT. That failed (results folded
-below) and pointed at the real problem — the distribution of the key vectors — which the codecs
-here address directly.
+The work began as an attempt to compress the KV cache with FFT. That failed (results folded at
+the bottom) and pointed at the real problem, the distribution of the key vectors, which the
+codecs here address directly.
 
 ![KV cache codec bench](docs/demo.png)
 
